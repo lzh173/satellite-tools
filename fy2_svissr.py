@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import gc
+import hashlib
 import json
 import math
 import os
@@ -907,6 +908,164 @@ def _subblock_from_doc(buf: bytes) -> Tuple[int, int, Dict[str, bytes]]:
     })
 
 
+class _BitVote:
+    """
+    按位多数表决器（用于子交换块的纠错）。
+
+    一块数据在一幅图里会被重复发送很多次（MANAM 10 KB 一组，每 200 行 8 份、一幅 2500 行
+    就有 ~100 份），因此不必只按"每套 8 份"表决：把每类每组的所有副本逐位累加，
+    最后按多数取比特，理论上能纠正 ⌊(n-1)/2⌋ 个错误比特。
+    """
+
+    __slots__ = ("nbytes", "counts", "total")
+
+    def __init__(self, nbytes: int):
+        self.nbytes = nbytes
+        self.counts = np.zeros(nbytes * 8, np.uint32)
+        self.total = 0
+
+    def add(self, blk: bytes) -> None:
+        if len(blk) < self.nbytes:
+            return
+        self.counts += np.unpackbits(np.frombuffer(blk[:self.nbytes], np.uint8))
+        self.total += 1
+
+    def result(self) -> Optional[bytes]:
+        if not self.total:
+            return None
+        bits = (self.counts.astype(np.uint32) * 2 >= self.total).astype(np.uint8)
+        return np.packbits(bits).tobytes()
+
+    def stats(self) -> Dict[str, float]:
+        """
+        copies   = 副本数
+        contested= 至少有一份副本与多数不同的比特数
+        strong   = 分歧超过 25% 的比特数（多数表决可能靠不住的那些）
+        rate     = 逐份误码率（少数派比特数 / (副本数 × 比特数)）
+        """
+        if not self.total:
+            return {"copies": 0, "contested": 0, "strong": 0, "rate": 0.0}
+        minority = np.minimum(self.counts, self.total - self.counts)
+        return {"copies": int(self.total),
+                "contested": int((minority > 0).sum()),
+                "strong": int((minority * 4 > self.total).sum()),
+                "rate": float(minority.sum()) / max(1, int(self.total) * minority.size)}
+
+
+def _add_global(gv: Dict[Tuple[str, int], "_BitVote"], g: int,
+                groups: Dict[str, bytes]) -> None:
+    """把一帧的子块并入全局表决器（跨套累计，用于拿到最高置信度的表）。"""
+    for k in SUB_KEYS:
+        blk = groups.get(k)
+        if not blk:
+            continue
+        v = gv.get((k, g))
+        if v is None:
+            v = gv[(k, g)] = _BitVote(SUB_SIZES[k])
+        v.add(blk)
+
+
+def _global_tables(gv: Dict[Tuple[str, int], "_BitVote"]) -> Dict[str, object]:
+    """把全局表决器结果整理成 {表类: {组号: bytes}} + 每类的统计。"""
+    tables: Dict[str, Dict[int, bytes]] = {k: {} for k in SUB_KEYS}
+    stats: Dict[str, object] = {}
+    for k in SUB_KEYS:
+        copies, contested, strong, rate = [], 0, 0, 0.0
+        for (kk, g), v in gv.items():
+            if kk != k:
+                continue
+            out = v.result()
+            if out is not None:
+                tables[k][g] = out
+            st = v.stats()
+            copies.append(st["copies"])
+            contested += int(st["contested"])
+            strong += int(st["strong"])
+            rate = max(rate, float(st["rate"]))
+        stats[k] = {"groups": len(tables[k]),
+                    "copies_min": min(copies) if copies else 0,
+                    "copies_max": max(copies) if copies else 0,
+                    "contested": contested, "strong": strong, "rate": rate,
+                    "bits": SUB_SIZES[k] * 8 * len(tables[k])}
+    return {"tables": tables, "stats": stats}
+
+
+def _hamming(a: bytes, b: bytes) -> int:
+    """两段等长数据的比特差异数（用于判断"换表"还是单纯误码）。"""
+    if len(a) != len(b):
+        return 1 << 20
+    x = np.bitwise_xor(np.frombuffer(a, np.uint8), np.frombuffer(b, np.uint8))
+    return int(np.unpackbits(x).sum())
+
+
+def _set_signature(st: Dict[str, object]) -> str:
+    """一套子块的"版本指纹"（用来发现中途换表）。"""
+    h = hashlib.md5()
+    for k in SUB_KEYS:
+        for g in range(25):
+            h.update(st["best"][k].get(g, b""))
+    return h.hexdigest()[:12]
+
+
+def _pick_tables(sets: List[Dict[str, object]], gv) -> Dict[str, object]:
+    """
+    选出最终的 5 张表。
+
+    * 各套结果一致（没有中途换表）→ 用**跨套累计表决**的结果：MANAM 这类一块能拿到
+      上百份副本，纠错能力远超单套的 8 份；
+    * 各套不一致（长录制里换了表）→ 退回最完整的那一套，并报告有几个版本。
+    """
+    merged = _global_tables(gv)
+    tables = merged["tables"]
+    # 逐套与"跨套表决结果"比距离：差得多的才是真的换表，差几个比特只是误码
+    odd_sets = []
+    for st in sets:
+        dist = 0
+        for k in SUB_KEYS:
+            for g, blk in st["best"][k].items():
+                ref = tables[k].get(g)
+                if ref is not None:
+                    dist += _hamming(blk, ref)
+        bits = sum(SUB_SIZES[k] * 8 * len(st["best"][k]) for k in SUB_KEYS)
+        frac = dist / max(bits, 1)
+        st["dist_to_merged"] = frac
+        # 阈值要跟着噪声走：单套只有 8 份副本、还夹着组号误码，和合并结果天然有差异；
+        # 真正的换表会让整块大面积不同（>50%），几个百分点只是误码
+        if frac > 0.15:
+            odd_sets.append(int(st["index"]) + 1)
+    info = {"sets": len(sets), "versions": 1 + len(odd_sets),
+            "copies": {k: merged["stats"][k]["copies_max"] for k in SUB_KEYS},
+            "rate": {k: merged["stats"][k]["rate"] for k in SUB_KEYS},
+            "contested": {k: merged["stats"][k]["contested"] for k in SUB_KEYS},
+            "strong": {k: merged["stats"][k]["strong"] for k in SUB_KEYS},
+            "groups": {k: len(tables[k]) for k in SUB_KEYS},
+            "odd_sets": odd_sets, "source": "merged"}
+    if odd_sets:
+        # 有套明显不同：多数派版本的套才参与表决（这里简化：退回最完整的一套）
+        best = _best_subset(sets)
+        info["source"] = "set"
+        info["groups"] = {k: int(best["stats"][k]["groups"]) for k in SUB_KEYS}
+        return {"tables": best["best"], "info": info}
+    return {"tables": tables, "info": info}
+
+
+def _log_tables(pick: Dict[str, object], log) -> None:
+    info = pick["info"]
+    src = ("跨套累计多数表决" if info["source"] == "merged"
+           else "最完整的一套（检测到中途换表）")
+    log(f"[i] 子块定表: 来源={src}，共 {info['sets']} 套 / {info['versions']} 个版本")
+    for k in SUB_KEYS:
+        n_bits = SUB_SIZES[k] * 8 * max(info["groups"].get(k, 0), 1)
+        strong = info["strong"].get(k, 0)
+        log(f"      {k:5s} {info['groups'].get(k, 0):2d}/25 组，最多 "
+            f"{info['copies'].get(k, 0):3d} 份副本，逐份误码率 "
+            f"{info['rate'].get(k, 0.0)*100:.2f}%，表决后强分歧 {strong} bit"
+            f"（{strong/n_bits*100:.4f}%）")
+    if info["odd_sets"]:
+        log(f"      ⚠ 第 {info['odd_sets']} 套与多数版本不一致（可能中途换表），"
+            "明细见 subblocks_sets.csv；要每套都留一份可加 --subblocks-all")
+
+
 def _new_subset(index: int, frame: int, tstamp: int) -> Dict[str, object]:
     return {"index": index, "first_frame": frame, "last_frame": frame,
             "first_time": tstamp, "last_time": tstamp, "frames": 0,
@@ -973,8 +1132,8 @@ def scan_subblocks(reader, n: int, log=print, max_sets: Optional[int] = None,
     只扫子交换块，不解图像 —— 面向"超长时间、几十幅图"的大文件。
 
     每帧只读文件段 2.3 KB（S-VISSR 帧长 44 KB、CSV 记录 41 KB）；先用相位投票确定
-    "200 行一套"的边界，再逐套收集各组 8 份副本做比特多数表决。只有每套的表决结果
-    （约 48 KB/套）留在内存里，几百 MB 的文件也不会爆内存。
+    "200 行一套"的边界，再逐套统计；同时把每类每组的**所有**副本累计进一个逐位投票器
+    （一块数据在一幅图里会被重发上百次），最后按多数纠错。
     """
     triples = []
     for i in range(n):
@@ -982,28 +1141,40 @@ def scan_subblocks(reader, n: int, log=print, max_sets: Optional[int] = None,
         triples.append((i, g, r))
     phase = _estimate_phase(triples)
 
+    gv: Dict[Tuple[str, int], "_BitVote"] = {}
     sets: Dict[int, Dict[str, object]] = {}
     cur: Optional[Dict[str, object]] = None
+    sync_err = 0
     for i in range(n):
         idx = (phase + i) // SUB_SET_LINES
         if max_sets is not None and idx >= max_sets:
             continue
         doc = reader.doc_bytes(i)
-        g, r, groups = _subblock_from_doc(doc)
-        if not (0 <= g < 25):
-            continue                    # 组号被误码打坏，跳过这一帧
+        g_obs, r, groups = _subblock_from_doc(doc)
+        # 组号以**观测值**为准：它是星上直接给的，最可靠。
+        # 只有观测值不可用（被误码打到 0~24 之外）时才用传输节拍推的组号兜底。
+        # 注意不能反过来一律用节拍推 —— 录到丢帧时帧序号和节拍会脱钩，整表会错位。
+        if 0 <= g_obs < 25:
+            g = g_obs
+        else:
+            g = ((phase + i) // 8) % 25
+            sync_err += 1
         if cur is None or int(cur["index"]) != idx:
             if cur is not None:
                 sets[int(cur["index"])] = _finish_subset(cur)
             cur = _new_subset(idx, i, int(_doc_summary(doc)[11]))
         _add_to_subset(cur, i, int(_doc_summary(doc)[11]), g, groups)
+        _add_global(gv, g, groups)
     if cur is not None:
         sets[int(cur["index"])] = _finish_subset(cur)
 
     out = [sets[k] for k in sorted(sets)]
+    pick = _pick_tables(out, gv)
     log(f"[i] 子块扫描: {n} 帧 / 相位 {phase} -> {len(out)} 套"
-        f"（完整 {sum(1 for s in out if s['complete'])} 套）")
-    return out
+        f"（完整 {sum(1 for s in out if s['complete'])} 套，"
+        f"组号不可用 {sync_err} 帧按节拍兜底）")
+    _log_tables(pick, log)
+    return out, pick
 
 
 def _best_subset(sets: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
@@ -1021,7 +1192,7 @@ def _write_subblock_sets(sets: List[Dict[str, object]], outdir: str, log=print,
     os.makedirs(d, exist_ok=True)
     rows = ["set,first_frame,last_frame,frames,start_utc,end_utc,complete,"
             "groups_grid,groups_orbit,groups_manam,groups_cal1,groups_cal2,"
-            "manam_1st_line,orbit_a_km,cal_updated"]
+            "diff_vs_merged_ppm,manam_1st_line,orbit_a_km,cal_updated"]
     for st in sets:
         orb = parse_orbit(_pack(st, "orbit"))
         man = decode_manam(_pack(st, "manam"))[0].split("\n")
@@ -1033,7 +1204,7 @@ def _write_subblock_sets(sets: List[Dict[str, object]], outdir: str, log=print,
             f'{mjd_to_iso(_bcd_ts_to_mjd(st["last_time"])) or ""},'
             f'{int(bool(st["complete"]))},'
             + ",".join(str(st["stats"][k]["groups"]) for k in SUB_KEYS)
-            + f',"{first_line[:60]}",'
+            + f',{st.get("dist_to_merged", 0.0) * 1e6:.1f},"{first_line[:60]}",'
             f'{(orb.get("orbit") or {}).get("semi_major_axis_km")},'
             f'{cal1.info.get("generated")}')
     with open(os.path.join(d, "subblocks_sets.csv"), "w", encoding="utf-8") as f:
@@ -1502,11 +1673,10 @@ def decode(path: str, outdir: str, *, max_frames: Optional[int] = None,
 
         # --- 只扫子交换块：不解图像，适合超长/多幅的大文件
         if subblocks_only:
-            sets = scan_subblocks(sf, n, log, max_sets=max_passes)
+            sets, pick = scan_subblocks(sf, n, log, max_sets=max_passes)
             os.makedirs(outdir, exist_ok=True)
+            _write_subblocks(pick["tables"], outdir, log)
             best = _best_subset(sets)
-            if best is not None:
-                _write_subblocks(best["best"], outdir, log)
             _write_subblock_sets(sets, outdir, log, dump_all=subblocks_all)
             meta = {
                 "source": os.path.abspath(path),
@@ -1645,6 +1815,7 @@ def _decode_pass(sf: "SVISSRFile", docs: Dict[str, np.ndarray],
         (i, *_subblock_from_doc(sf.doc_bytes(i))[:2]) for i in sample)
     sb_sets: List[Dict[str, object]] = []
     cur_set: Optional[Dict[str, object]] = None
+    gv: Dict[Tuple[str, int], "_BitVote"] = {}
     consts: List[Dict[str, Optional[float]]] = []
     used = 0
     dups = 0
@@ -1656,14 +1827,15 @@ def _decode_pass(sf: "SVISSRFile", docs: Dict[str, np.ndarray],
         fr = sf.frame(i, with_images=True)
         done += 1
         consts.append(fr.const)
-        g, rp = fr.sub_group, fr.sub_repeat
-        if 0 <= g < 25:
-            set_idx = (phase + i) // SUB_SET_LINES
-            if cur_set is None or int(cur_set["index"]) != set_idx:
-                if cur_set is not None:
-                    sb_sets.append(_finish_subset(cur_set))
-                cur_set = _new_subset(set_idx, i, int(docs["time"][i]))
-            _add_to_subset(cur_set, i, int(docs["time"][i]), g, fr.groups)
+        # 组号以观测值为准，坏了才用节拍兜底（见 scan_subblocks 里的说明）
+        g = fr.sub_group if 0 <= fr.sub_group < 25 else ((phase + i) // 8) % 25
+        set_idx = (phase + i) // SUB_SET_LINES
+        if cur_set is None or int(cur_set["index"]) != set_idx:
+            if cur_set is not None:
+                sb_sets.append(_finish_subset(cur_set))
+            cur_set = _new_subset(set_idx, i, int(docs["time"][i]))
+        _add_to_subset(cur_set, i, int(docs["time"][i]), g, fr.groups)
+        _add_global(gv, g, fr.groups)
         r = rows.get(i)
         if r is None:
             continue
@@ -1693,16 +1865,16 @@ def _decode_pass(sf: "SVISSRFile", docs: Dict[str, np.ndarray],
         if done % 400 == 0:
             log(f"    ... {done}/{total_jobs} 帧（回扫）")
 
-    # 每套表决后取最完整的一套作为该幅的定标/网格/轨道/MANAM 来源
+    # 逐套统计 + 跨套累计表决（一块会被重发上百次，纠错余量很大）
     if cur_set is not None:
         sb_sets.append(_finish_subset(cur_set))
-    best_st = _best_subset(sb_sets)
-    sub_best: Dict[str, Dict[int, bytes]] = (best_st["best"] if best_st
-                                             else {k: {} for k in SUB_KEYS})
+    pick = _pick_tables(sb_sets, gv)
+    sub_best: Dict[str, Dict[int, bytes]] = pick["tables"]
     if sb_sets:
         log(f"[i] 子交换块: {len(sb_sets)} 套（完整 "
-            f"{sum(1 for s in sb_sets if s['complete'])} 套），采用第 "
-            f"{int(best_st['index']) + 1} 套")
+            f"{sum(1 for s in sb_sets if s['complete'])} 套）")
+        _log_tables(pick, log)
+    subblock_pick = pick
 
     cal = Calibration.from_groups(sub_best, "cal2")
     if not cal.ir:
