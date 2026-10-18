@@ -51,6 +51,7 @@ import argparse
 import datetime as _dt
 import gc
 import json
+import math
 import os
 import struct
 import sys
@@ -556,6 +557,549 @@ def parse_grid(blob: bytes) -> np.ndarray:
     return a
 
 
+MANAM_GROUP_BYTES = 410        # 每组 410 字节
+MANAM_LINES_PER_GROUP = 5      # 每组 5 个字符串
+MANAM_LINE_BYTES = 82          # 每个字符串 82 字节 = 80 字符 + CR + LF
+MANAM_TOTAL = 25 * MANAM_GROUP_BYTES   # 10250 字节
+
+ORBIT_GROUP_BYTES = 128        # 每组 128 字节
+ORBIT_TOTAL = 25 * ORBIT_GROUP_BYTES   # 轨道和姿态数据 3200 字节（表 4.12）
+MU_EARTH = 398600.4418         # km^3/s^2
+SIDEREAL_DAY_S = 86164.0905
+
+# 表 4.12：(1 基位置, 字节数, 小数位数, 字段名, 合理范围)
+# 合理范围用来过滤"没填/被误码打坏"的字段（None = 只做基本类型检查）
+ORBIT_FIELDS: List[Tuple[int, int, int, str, Optional[Tuple[float, float]]]] = [
+    (1, 6, 8, "obs_start_mjd", (50000, 70000)),
+    (7, 4, 8, "vis_step_rad", (0, 1e-3)),
+    (11, 4, 8, "ir_step_rad", (0, 1e-3)),
+    (15, 4, 10, "vis_sample_rad", (0, 1e-3)),
+    (19, 4, 10, "ir_sample_rad", (0, 1e-3)),
+    (23, 4, 4, "vis_center_row", (1, 20000)),
+    (27, 4, 4, "ir1_center_row", (1, 5000)),
+    (31, 4, 4, "vis_center_col", (1, 20000)),
+    (35, 4, 4, "ir1_center_col", (1, 5000)),
+    (39, 4, 0, "vis_sensors", (1, 16)),
+    (43, 4, 0, "ir_sensors", (1, 16)),
+    (47, 4, 0, "vis_frame_lines", (1, 20000)),
+    (51, 4, 0, "ir_frame_lines", (1, 5000)),
+    (55, 4, 0, "vis_frame_cols", (1, 20000)),
+    (59, 4, 0, "ir_frame_cols", (1, 5000)),
+    (63, 4, 10, "misalign_x_rad", (-0.5, 0.5)),
+    (67, 4, 10, "misalign_y_rad", (-0.5, 0.5)),
+    (71, 4, 10, "misalign_z_rad", (-0.5, 0.5)),
+    (111, 4, 4, "ir2_center_row", (1, 5000)),
+    (115, 4, 4, "ir3_center_row", (1, 5000)),
+    (119, 4, 4, "ir2_center_col", (1, 5000)),
+    (123, 4, 4, "ir3_center_col", (1, 5000)),
+    (129, 4, 7, "pi", (3.14, 3.15)),
+    (133, 4, 9, "deg_per_rad", (0.017, 0.018)),
+    (137, 4, 6, "rad_per_deg", (57, 57.5)),
+    (141, 4, 1, "earth_radius_m", (6.3e6, 6.4e6)),
+    (145, 4, 10, "earth_flattening", (0.003, 0.004)),
+    (149, 4, 9, "earth_eccentricity", (0.08, 0.085)),
+    (153, 4, 8, "sun_sensor_angle_rad", (0, 3.2)),
+    (157, 6, 8, "orbit_epoch_mjd", (50000, 70000)),
+    (163, 6, 8, "semi_major_axis_km", (40000, 45000)),
+    (169, 6, 10, "eccentricity", (0, 0.01)),
+    (175, 6, 8, "inclination_deg", (0, 15)),
+    (181, 6, 8, "raan_deg", (-360, 360)),
+    (187, 6, 8, "arg_perigee_deg", (-360, 360)),
+    (193, 6, 8, "mean_anomaly_deg", (-360, 360)),
+    (199, 6, 6, "subsat_lon_deg", (-180, 180)),
+    (205, 6, 6, "subsat_lat_deg", (-15, 15)),
+    (211, 6, 8, "attitude_epoch_mjd", (50000, 70000)),
+    (217, 6, 8, "alpha_r_rad", (-3.2, 3.2)),
+    (223, 6, 15, "alpha_r_rate", (-1e-3, 1e-3)),
+    (229, 6, 11, "delta_r_rad", (-0.5, 0.5)),
+    (235, 6, 15, "delta_r_rate", (-1e-3, 1e-3)),
+    (241, 6, 8, "spin_rate_rpm", (90, 110)),
+    (2945, 6, 8, "att_fcst_first_mjd", (50000, 70000)),
+    (2951, 6, 8, "att_fcst_last_mjd", (50000, 70000)),
+    (2957, 6, 8, "att_fcst_interval_days", (0, 1)),
+    (2965, 6, 8, "orb_fcst_first_mjd", (50000, 70000)),
+    (2971, 6, 8, "orb_fcst_last_mjd", (50000, 70000)),
+    (2977, 6, 8, "orb_fcst_interval_days", (0, 1)),
+    (2985, 4, 4, "ir4_center_row", (1, 5000)),
+    (2989, 4, 4, "ir4_center_col", (1, 5000)),
+]
+ORBIT_INTS = [(2963, 2, "att_fcst_count", (0, 64)), (2983, 2, "orb_fcst_count", (0, 64))]
+
+
+def mjd_to_iso(mjd: Optional[float]) -> Optional[str]:
+    """MJD -> 'YYYY-MM-DD hh:mm:ss.cc UTC'（MJD 40587 = 1970-01-01）。"""
+    if mjd is None:
+        return None
+    try:
+        secs = round((mjd - 40587.0) * 86400.0, 2)      # 先取到 10 ms，避免 .99 借位
+        t = _dt.datetime(1970, 1, 1) + _dt.timedelta(seconds=secs)
+    except (OverflowError, ValueError):
+        return None
+    return t.strftime("%Y-%m-%d %H:%M:%S.") + f"{t.microsecond // 10000:02d} UTC"
+
+
+def parse_orbit(blob: bytes) -> Dict[str, object]:
+    """
+    解析轨道和姿态数据块（表 4.12，3200 字节 = 25 组 × 128 字节），并做物理校验。
+
+    个别字段在这类产品里没填、或标度与文档不符，这里按合理范围过滤：超范围的置 None
+    并记进 `unreliable`，避免把垃圾值当真值输出。
+    """
+    out: Dict[str, object] = {"raw_len": len(blob), "unreliable": []}
+    if len(blob) < ORBIT_TOTAL:
+        out["unreliable"].append("整块数据不全")
+        return out
+
+    val: Dict[str, Optional[float]] = {}
+    for pos, n, dec, key, rng in ORBIT_FIELDS:
+        v = real_nm(blob[pos - 1:pos - 1 + n], dec)
+        if rng is not None and not (rng[0] <= v <= rng[1]):
+            out["unreliable"].append(key)
+            v = None
+        val[key] = v
+    for pos, n, key, rng in ORBIT_INTS:
+        v = int.from_bytes(blob[pos - 1:pos - 1 + n], "big")
+        val[key] = v if rng[0] <= v <= rng[1] else None
+
+    a_km = val["semi_major_axis_km"]
+    re_m = val["earth_radius_m"] or 6378137.0
+    height_m = (a_km * 1000.0 - re_m) if a_km else None
+    period_s = (2 * math.pi * math.sqrt(a_km ** 3 / MU_EARTH)) if a_km else None
+    gsd = {}
+    for key, tag in (("ir_sample_rad", "ir"), ("vis_sample_rad", "vis")):
+        ang = val[key]
+        gsd[tag] = (ang * height_m) if (ang and height_m) else None
+
+    def urad(key: str) -> Optional[float]:
+        v = val.get(key)
+        return None if v is None else v * 1e6
+
+    out.update({
+        "obs_start": {"mjd": val["obs_start_mjd"],
+                      "utc": mjd_to_iso(val["obs_start_mjd"])},
+        "orbit": {
+            "epoch_mjd": val["orbit_epoch_mjd"],
+            "epoch_utc": mjd_to_iso(val["orbit_epoch_mjd"]),
+            "semi_major_axis_km": a_km,
+            "eccentricity": val["eccentricity"],
+            "inclination_deg": val["inclination_deg"],
+            "raan_deg": val["raan_deg"],
+            "arg_perigee_deg": val["arg_perigee_deg"],
+            "mean_anomaly_deg": val["mean_anomaly_deg"],
+            "subsat_lon_deg": val["subsat_lon_deg"],
+            "subsat_lat_deg": val["subsat_lat_deg"],
+            "height_km": (height_m / 1000.0) if height_m else None,
+            "period_s": period_s,
+            "period_vs_sidereal_s": (period_s - SIDEREAL_DAY_S) if period_s else None,
+        },
+        "attitude": {
+            "epoch_mjd": val["attitude_epoch_mjd"],
+            "epoch_utc": mjd_to_iso(val["attitude_epoch_mjd"]),
+            "spin_rate_rpm": val["spin_rate_rpm"],
+            "alpha_r_rad": val["alpha_r_rad"],
+            "alpha_r_rate": val["alpha_r_rate"],
+            "delta_r_rad": val["delta_r_rad"],
+            "delta_r_rate": val["delta_r_rate"],
+        },
+        "misalignment": {
+            "x_rad": val["misalign_x_rad"],
+            "y_rad": val["misalign_y_rad"],
+            "z_rad": val["misalign_z_rad"],
+            "x_deg": (math.degrees(val["misalign_x_rad"])
+                      if val["misalign_x_rad"] is not None else None),
+            "y_deg": (math.degrees(val["misalign_y_rad"])
+                      if val["misalign_y_rad"] is not None else None),
+            "z_deg": (math.degrees(val["misalign_z_rad"])
+                      if val["misalign_z_rad"] is not None else None),
+        },
+        "instrument": {
+            "vis_step_urad": urad("vis_step_rad"),
+            "ir_step_urad": urad("ir_step_rad"),
+            "vis_sample_urad": urad("vis_sample_rad"),
+            "ir_sample_urad": urad("ir_sample_rad"),
+            "vis_sensors": val["vis_sensors"],
+            "ir_sensors": val["ir_sensors"],
+            "vis_frame": [val["vis_frame_lines"], val["vis_frame_cols"]],
+            "ir_frame": [val["ir_frame_lines"], val["ir_frame_cols"]],
+            "centers": {
+                "vis": [val["vis_center_row"], val["vis_center_col"]],
+                "ir1": [val["ir1_center_row"], val["ir1_center_col"]],
+                "ir2": [val["ir2_center_row"], val["ir2_center_col"]],
+                "ir3": [val["ir3_center_row"], val["ir3_center_col"]],
+                "ir4": [val["ir4_center_row"], val["ir4_center_col"]],
+            },
+            "gsd_ir_m": gsd.get("ir"),
+            "gsd_vis_m": gsd.get("vis"),
+        },
+        "constants": {
+            "pi": val["pi"],
+            "deg_per_rad": val["deg_per_rad"],
+            "rad_per_deg": val["rad_per_deg"],
+            "earth_radius_m": val["earth_radius_m"],
+            "earth_flattening": val["earth_flattening"],
+            "earth_eccentricity": val["earth_eccentricity"],
+            "sun_sensor_angle_rad": val["sun_sensor_angle_rad"],
+        },
+        "forecast": {
+            "attitude": {"count": val["att_fcst_count"],
+                         "first": mjd_to_iso(val["att_fcst_first_mjd"]),
+                         "last": mjd_to_iso(val["att_fcst_last_mjd"]),
+                         "interval_days": val["att_fcst_interval_days"]},
+            "orbit": {"count": val["orb_fcst_count"],
+                      "first": mjd_to_iso(val["orb_fcst_first_mjd"]),
+                      "last": mjd_to_iso(val["orb_fcst_last_mjd"]),
+                      "interval_days": val["orb_fcst_interval_days"]},
+        },
+    })
+    out["unreliable"] += [
+        "misalign_matrix（表 4.12 第 75~110 字节：标度与文档不符，解出不成正交阵，未采用）",
+        "attitude_forecast_content（表 4.13 各子块内容）",
+        "orbit_forecast_content（表 4.14 各子块内容）",
+    ]
+    return out
+
+
+def _write_orbit(blob: bytes, outdir: str, log=print) -> Dict[str, object]:
+    """解析轨道/姿态块，输出 orbit.json + 人读版 orbit.txt。"""
+    o = parse_orbit(blob)
+    with open(os.path.join(outdir, "orbit.json"), "w", encoding="utf-8") as f:
+        json.dump(o, f, ensure_ascii=False, indent=2)
+
+    orb = o.get("orbit", {})
+    att = o.get("attitude", {})
+    ins = o.get("instrument", {})
+    mis = o.get("misalignment", {})
+    con = o.get("constants", {})
+    fc = o.get("forecast", {})
+
+    def f(v, fmt="{:.6g}", unit=""):
+        return "—" if v is None else fmt.format(v) + unit
+
+    def deg(rad):
+        return None if rad is None else math.degrees(rad)
+
+    L = ["=== 轨道与姿态数据（表 4.12，25 组 × 128 字节子交换拼成 3200 字节） ===",
+         f"观测开始时间   : {o['obs_start']['utc']}  (MJD {f(o['obs_start']['mjd'])})",
+         "",
+         "--- 轨道根数（J2000.0 平天球坐标系）---",
+         f"历元           : {orb.get('epoch_utc')}  (MJD {f(orb.get('epoch_mjd'))})",
+         f"半长轴         : {f(orb.get('semi_major_axis_km'), '{:.4f}', ' km')}",
+         f"偏心率         : {f(orb.get('eccentricity'), '{:.8f}')}",
+         f"倾角           : {f(orb.get('inclination_deg'), '{:.4f}', '°')}",
+         f"升交点赤经 Ω   : {f(orb.get('raan_deg'), '{:.4f}', '°')}",
+         f"近地点辐角 ω   : {f(orb.get('arg_perigee_deg'), '{:.4f}', '°')}",
+         f"平近点角 M     : {f(orb.get('mean_anomaly_deg'), '{:.4f}', '°')}",
+         f"历元星下点     : {f(orb.get('subsat_lat_deg'), '{:.4f}', '°N')}, "
+         f"{f(orb.get('subsat_lon_deg'), '{:.4f}', '°E')}",
+         f"标称高度       : {f(orb.get('height_km'), '{:.2f}', ' km')}  (a − Re)",
+         f"轨道周期       : {f(orb.get('period_s'), '{:.1f}', ' s')} = "
+         f"{f((orb.get('period_s') or 0) / 86400.0 if orb.get('period_s') else None, '{:.6f}', ' 天')}"
+         f"   [恒星日 86164.09 s，差 {f(orb.get('period_vs_sidereal_s'), '{:+.1f}', ' s')}]",
+         "",
+         "--- 姿态 ---",
+         f"历元           : {att.get('epoch_utc')}  (MJD {f(att.get('epoch_mjd'))})",
+         f"自旋速率       : {f(att.get('spin_rate_rpm'), '{:.3f}', ' 转/分')}",
+         f"αr（自旋轴方位）: {f(att.get('alpha_r_rad'), '{:.6f}', ' rad')}"
+         f" = {f(deg(att.get('alpha_r_rad')), '{:.3f}', '°')}",
+         f"δr             : {f(att.get('delta_r_rad'))}"
+         + ("" if att.get("delta_r_rad") is not None else "   ← 本产品未填/不可用"),
+         "",
+         "--- 仪器几何（采样/步进角 × 高度）---",
+         f"可见光         : 步进 {f(ins.get('vis_step_urad'), '{:.2f}', ' µrad')} / "
+         f"采样 {f(ins.get('vis_sample_urad'), '{:.2f}', ' µrad')} → 星下点 "
+         f"{f(ins.get('gsd_vis_m'), '{:.2f}', ' m')}；{f(ins.get('vis_sensors'), '{:.0f}', ' 个传感器')}",
+         f"红外           : 步进 {f(ins.get('ir_step_urad'), '{:.2f}', ' µrad')} / "
+         f"采样 {f(ins.get('ir_sample_urad'), '{:.2f}', ' µrad')} → 星下点 "
+         f"{f(ins.get('gsd_ir_m'), '{:.2f}', ' m')}；{f(ins.get('ir_sensors'), '{:.0f}', ' 个传感器')}",
+         ]
+    vf = ins.get("vis_frame") or [None, None]
+    irf = ins.get("ir_frame") or [None, None]
+    L.append(f"帧几何         : VIS {f(vf[0], '{:.0f}')}×{f(vf[1], '{:.0f}')}，"
+             f"IR {f(irf[0], '{:.0f}')}×{f(irf[1], '{:.0f}')}")
+    L.append("帧中心行列     : " + "，".join(
+        f"{k}({f(v[0], '{:.0f}')},{f(v[1], '{:.0f}')})"
+        for k, v in (ins.get("centers") or {}).items()))
+    L += ["",
+          "--- 图像仪失配 ---",
+          f"绕 x/y/z 失配角: {f(mis.get('x_deg'), '{:+.4f}', '°')} / "
+          f"{f(mis.get('y_deg'), '{:+.4f}', '°')} / {f(mis.get('z_deg'), '{:+.4f}', '°')}"
+          f"   ({f(mis.get('x_rad'), '{:+.6f}')} / {f(mis.get('y_rad'), '{:+.6f}')} / "
+          f"{f(mis.get('z_rad'), '{:+.6f}')} rad)",
+          "失配矩阵       : 未解出（文档标度与实际不符、且不成正交阵）；原始见 subblocks/orbit.bin",
+          "",
+          "--- 地球与常数 ---",
+          f"π              : {f(con.get('pi'), '{:.7f}')}   "
+          f"1° = {f(con.get('deg_per_rad'), '{:.9f}', ' rad')}   "
+          f"1 rad = {f(con.get('rad_per_deg'), '{:.6f}', '°')}",
+          f"地球           : Re = {f(con.get('earth_radius_m'), '{:.0f}', ' m')}  "
+          f"扁率 = {f(con.get('earth_flattening'), '{:.9f}')}  "
+          f"偏心率 = {f(con.get('earth_eccentricity'), '{:.9f}')}",
+          f"太阳传感器夹角 : {f(con.get('sun_sensor_angle_rad'), '{:.6f}', ' rad')}",
+          "",
+          "--- 预报数据（本产品子块内容未按文档填，只解出时间轴与组数）---"]
+    for tag, key in (("姿态", "attitude"), ("轨道", "orbit")):
+        c = fc.get(key, {})
+        L.append(f"{tag}预报         : {f(c.get('count'), '{:.0f}', ' 组')}  "
+                 f"{c.get('first')} ~ {c.get('last')}  间隔 "
+                 f"{f(c.get('interval_days'), '{:.8f}', ' 天')}")
+    if o.get("unreliable"):
+        L += ["", "--- 未通过校验/不可靠 ---"] + [f"  · {x}" for x in o["unreliable"]]
+    L.append("")
+    with open(os.path.join(outdir, "orbit.txt"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(L))
+    log("[+] orbit.json / orbit.txt  (星下点 "
+        f"{f(orb.get('subsat_lon_deg'), '{:.3f}', '°E')}，"
+        f"周期 {f(orb.get('period_s'), '{:.0f}', ' s')}，"
+        f"自旋 {f(att.get('spin_rate_rpm'), '{:.2f}', ' rpm')})")
+    return o
+
+
+def decode_manam(blob: bytes) -> Tuple[str, Dict[str, object]]:
+    """
+    解码卫星周工作日程表（MANAM，表 4.7 第 7 块，10250 字节 = 25 组 × 410 字节）。
+
+    文档写的是每组 5 个 82 字节字符串（80 字符 + CR + LF），但实测 FY-2G 的数据是
+    **80 字符 + 单个 LF**（81 字节一行、整块没有 CR），按 82 字节硬切会逐行错位。
+    因此这里优先按 LF/CR 切行，只有整块一个换行都没有时才回退到定长 82 字节切法。
+    """
+    raw = blob.rstrip(b"\x00 ")
+    if b"\n" in raw or b"\r" in raw:
+        raw = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        parts = raw.split(b"\n")
+        mode = "LF/CR 切行"
+    else:
+        parts = [blob[i * MANAM_LINE_BYTES:(i + 1) * MANAM_LINE_BYTES]
+                 for i in range(len(blob) // MANAM_LINE_BYTES)]
+        mode = "定长 82 字节"
+
+    lines: List[str] = []
+    nonempty = 0
+    garbled = 0
+    for p in parts:
+        txt = p.decode("ascii", "replace")
+        garbled += sum(1 for ch in txt if not (32 <= ord(ch) < 127))
+        txt = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in txt).rstrip()
+        if txt:
+            nonempty += 1
+        lines.append(txt)
+    while lines and not lines[-1]:
+        lines.pop()
+    info = {"lines": len(lines), "non_empty": nonempty,
+            "garbled_chars": garbled, "split": mode}
+    return "\n".join(lines) + "\n", info
+
+
+SUB_KEYS = ("grid", "orbit", "manam", "cal1", "cal2")
+SUB_SIZES = {"grid": 100, "orbit": ORBIT_GROUP_BYTES,
+             "manam": MANAM_GROUP_BYTES, "cal1": 256, "cal2": 1024}
+SUB_SET_LINES = 200            # 200 条扫描线传完一套（25 组 × 8 次重复）
+
+
+def _subblock_from_doc(buf: bytes) -> Tuple[int, int, Dict[str, bytes]]:
+    """从文件段字节里切出 (组号, 重复计数, 5 类子块)。"""
+    blk = buf[2:2293]
+    return (blk[191], blk[193], {
+        "grid": blk[DOC_GRID[0]:DOC_GRID[1]],
+        "orbit": blk[DOC_ORBIT[0]:DOC_ORBIT[1]],
+        "manam": blk[DOC_MANAM[0]:DOC_MANAM[1]],
+        "cal1": blk[DOC_CAL1[0]:DOC_CAL1[1]],
+        "cal2": blk[DOC_CAL2[0]:DOC_CAL2[1]],
+    })
+
+
+def _new_subset(index: int, frame: int, tstamp: int) -> Dict[str, object]:
+    return {"index": index, "first_frame": frame, "last_frame": frame,
+            "first_time": tstamp, "last_time": tstamp, "frames": 0,
+            "copies": {k: {} for k in SUB_KEYS}}
+
+
+def _add_to_subset(st: Dict[str, object], frame: int, tstamp: int,
+                   g: int, groups: Dict[str, bytes]) -> None:
+    """把一帧的子块并入当前"套"（每类每组的副本最多留 8 份）。"""
+    st["last_frame"] = frame
+    if tstamp >= 0:
+        st["last_time"] = tstamp
+        if st["first_time"] < 0:
+            st["first_time"] = tstamp
+    st["frames"] = int(st["frames"]) + 1
+    copies = st["copies"]
+    for k in SUB_KEYS:
+        blk = groups.get(k)
+        if not blk:
+            continue
+        lst = copies[k].setdefault(g, [])
+        if len(lst) < 8:
+            lst.append(blk)
+
+
+def _finish_subset(st: Dict[str, object]) -> Dict[str, object]:
+    """逐组比特多数表决，得到该套的 5 张表 + 完整性统计。"""
+    best: Dict[str, Dict[int, bytes]] = {}
+    stats: Dict[str, object] = {}
+    for k in SUB_KEYS:
+        groups = {g: _vote_bytes(v) for g, v in st["copies"][k].items()}
+        best[k] = groups
+        stats[k] = {"groups": len(groups),
+                    "missing": [g for g in range(25) if g not in groups]}
+    st["best"] = best
+    st["stats"] = stats
+    st["complete"] = sum(int(stats[k]["groups"]) for k in SUB_KEYS) == 25 * len(SUB_KEYS)
+    st["copies"] = {}                  # 表决完就丢掉副本，长文件也只留每套的结果
+    return st
+
+
+def _estimate_phase(triples) -> int:
+    """
+    估计子交换的"传输相位"。
+
+    文档规定每 200 条扫描线一套（25 组 × 8 次重复），所以第 i 帧的传输序号
+    `T = phase + i`（帧与扫描线一一对应），组号应为 `(T // 8) % 25`、重复计数 `T % 8`。
+    由大量帧的 (帧号, 组号, 重复计数) 反解 `phase ≡ 8g+r-i (mod 200)` 并取众数，
+    个别帧的组号被误码打坏也不影响。
+    """
+    from collections import Counter
+    votes: Counter = Counter()
+    for i, g, r in triples:
+        if 0 <= g < 25:
+            votes[(g * 8 + (r & 7) - i) % SUB_SET_LINES] += 1
+    if not votes:
+        return 0
+    return int(votes.most_common(1)[0][0])
+
+
+def scan_subblocks(reader, n: int, log=print, max_sets: Optional[int] = None,
+                   keep_all: bool = False) -> List[Dict[str, object]]:
+    """
+    只扫子交换块，不解图像 —— 面向"超长时间、几十幅图"的大文件。
+
+    每帧只读文件段 2.3 KB（S-VISSR 帧长 44 KB、CSV 记录 41 KB）；先用相位投票确定
+    "200 行一套"的边界，再逐套收集各组 8 份副本做比特多数表决。只有每套的表决结果
+    （约 48 KB/套）留在内存里，几百 MB 的文件也不会爆内存。
+    """
+    triples = []
+    for i in range(n):
+        g, r, _ = _subblock_from_doc(reader.doc_bytes(i))
+        triples.append((i, g, r))
+    phase = _estimate_phase(triples)
+
+    sets: Dict[int, Dict[str, object]] = {}
+    cur: Optional[Dict[str, object]] = None
+    for i in range(n):
+        idx = (phase + i) // SUB_SET_LINES
+        if max_sets is not None and idx >= max_sets:
+            continue
+        doc = reader.doc_bytes(i)
+        g, r, groups = _subblock_from_doc(doc)
+        if not (0 <= g < 25):
+            continue                    # 组号被误码打坏，跳过这一帧
+        if cur is None or int(cur["index"]) != idx:
+            if cur is not None:
+                sets[int(cur["index"])] = _finish_subset(cur)
+            cur = _new_subset(idx, i, int(_doc_summary(doc)[11]))
+        _add_to_subset(cur, i, int(_doc_summary(doc)[11]), g, groups)
+    if cur is not None:
+        sets[int(cur["index"])] = _finish_subset(cur)
+
+    out = [sets[k] for k in sorted(sets)]
+    log(f"[i] 子块扫描: {n} 帧 / 相位 {phase} -> {len(out)} 套"
+        f"（完整 {sum(1 for s in out if s['complete'])} 套）")
+    return out
+
+
+def _best_subset(sets: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    """挑一套最完整的（优先完整套，其次组数最多的）。"""
+    if not sets:
+        return None
+    return max(sets, key=lambda s: (bool(s["complete"]),
+                                    sum(int(v["groups"]) for v in s["stats"].values())))
+
+
+def _write_subblock_sets(sets: List[Dict[str, object]], outdir: str, log=print,
+                         dump_all: bool = False) -> None:
+    """输出 subblocks_sets.csv（每套的完整性/表版本摘要），可选每套各存一份表。"""
+    d = os.path.join(outdir, "subblocks")
+    os.makedirs(d, exist_ok=True)
+    rows = ["set,first_frame,last_frame,frames,start_utc,end_utc,complete,"
+            "groups_grid,groups_orbit,groups_manam,groups_cal1,groups_cal2,"
+            "manam_1st_line,orbit_a_km,cal_updated"]
+    for st in sets:
+        orb = parse_orbit(_pack(st, "orbit"))
+        man = decode_manam(_pack(st, "manam"))[0].split("\n")
+        first_line = next((x.strip() for x in man if x.strip()), "")
+        cal1 = Calibration.from_groups({"cal1": st["best"]["cal1"]}, "cal1")
+        rows.append(
+            f'{st["index"]},{st["first_frame"]},{st["last_frame"]},{st["frames"]},'
+            f'{mjd_to_iso(_bcd_ts_to_mjd(st["first_time"])) or ""},'
+            f'{mjd_to_iso(_bcd_ts_to_mjd(st["last_time"])) or ""},'
+            f'{int(bool(st["complete"]))},'
+            + ",".join(str(st["stats"][k]["groups"]) for k in SUB_KEYS)
+            + f',"{first_line[:60]}",'
+            f'{(orb.get("orbit") or {}).get("semi_major_axis_km")},'
+            f'{cal1.info.get("generated")}')
+    with open(os.path.join(d, "subblocks_sets.csv"), "w", encoding="utf-8") as f:
+        f.write("\n".join(rows) + "\n")
+    log(f"[+] subblocks/subblocks_sets.csv  {len(sets)} 套")
+
+    if dump_all:
+        for st in sets:
+            sub = os.path.join(d, f"set{st['index'] + 1:02d}")
+            os.makedirs(sub, exist_ok=True)
+            for k in SUB_KEYS:
+                with open(os.path.join(sub, f"{k}.bin"), "wb") as f:
+                    f.write(_pack(st, k))
+            txt, _ = decode_manam(_pack(st, "manam"))
+            with open(os.path.join(sub, "manam.txt"), "w", encoding="utf-8",
+                      newline="\n") as f:
+                f.write(txt)
+        log(f"[+] subblocks/setNN/  每套一份（{len(sets)} 套）")
+
+
+def _pack(st: Dict[str, object], key: str) -> bytes:
+    """把某一套的某一类子块按组号拼成完整块（缺失组补零）。"""
+    groups = st["best"].get(key, {})
+    sz = SUB_SIZES[key]
+    return b"".join(groups.get(g, bytes(sz)) for g in range(25))
+
+
+def _bcd_ts_to_mjd(ts: int) -> Optional[float]:
+    """YYYYMMDDhhmmsscc 的 BCD 整数 -> MJD（只用于显示套的时间范围）。"""
+    if ts is None or ts < 0 or not _ts_valid(ts):
+        return None
+    s = str(ts).zfill(16)
+    try:
+        t = _dt.datetime(int(s[0:4]), int(s[4:6]), int(s[6:8]),
+                         int(s[8:10]), int(s[10:12]), int(s[12:14]))
+    except ValueError:
+        return None
+    return (t - _dt.datetime(1858, 11, 17)).total_seconds() / 86400.0
+
+
+def _write_subblocks(best: Dict[str, Dict[int, bytes]], outdir: str, log=print) -> None:
+    """把 5 类子交换块按组号拼好导出（原始 .bin + MANAM 文本），保证不丢数据。"""
+    d = os.path.join(outdir, "subblocks")
+    os.makedirs(d, exist_ok=True)
+    got = {}
+    for key, sz in SUB_SIZES.items():
+        groups = best.get(key, {})
+        got[key] = len(groups)
+        blob = b"".join(groups.get(g, bytes(sz)) for g in range(25))
+        with open(os.path.join(d, f"{key}.bin"), "wb") as f:
+            f.write(blob)
+    # 轨道与姿态：表 4.12，顺带解出人读版
+    orbit_blob = b"".join(best.get("orbit", {}).get(g, bytes(ORBIT_GROUP_BYTES))
+                          for g in range(25))
+    if len(best.get("orbit", {})) == 25:
+        _write_orbit(orbit_blob, outdir, log)
+
+    manam_blob = b"".join(best.get("manam", {}).get(g, bytes(MANAM_GROUP_BYTES))
+                          for g in range(25))
+    txt, info = decode_manam(manam_blob)
+    with open(os.path.join(d, "manam.txt"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(txt)
+    log(f"[+] subblocks/  组数 " + " ".join(f"{k}={v}/25" for k, v in got.items())
+        + f"；MANAM {info['lines']} 行（非空 {info['non_empty']}）-> manam.txt")
+
+
 # ============================================================== 7. 数据集
 class SVISSRFile:
     """S-VISSR 2.0 码流读取器。"""
@@ -590,9 +1134,159 @@ class SVISSRFile:
         buf = buf[:FRAME_BYTES]
         return parse_frame(buf, i, with_images, self.check_crc)
 
+    def doc_bytes(self, i: int) -> bytes:
+        """
+        只取文件段（2293 字节 = 2 字节段识别码 + 2291 字节数据块）。
+        扫子块时每帧只读 2.3 KB 而不是 44 KB，几百 MB 的文件也能很快扫完。
+        """
+        if self.transform != "none":
+            return self.frame_bytes(i)[:2293]
+        a = self.skip + i * self.stride
+        return self._mm[a:a + 2293].tobytes()
+
+    def doc_summary(self, i: int) -> Tuple[int, ...]:
+        """扫描阶段用的极简文件段摘要（前 2293 字节就够，不需要整帧）。"""
+        return _doc_summary(self.doc_bytes(i))
+
     def __iter__(self):
         for i in range(self.n_frames):
             yield self.frame(i)
+
+
+# ------------------------------------------------------- CSV（压缩 S-VISSR）存档
+CSV_REC = 41260                     # 每条记录 330080 bit = 41260 字节（表 4.19）
+CSV_DOC_OFF, CSV_DOC_LEN = 3, 2293  # 记录号 2B + 行质量码 1B 之后是 DOC 段
+CSV_IR_OFF = (2296, 5162, 8028, 10894)      # IR1~IR4 段（各 2866 B，表 4.22）
+CSV_VIS_OFF = (13760, 20635, 27510, 34385)  # VIS1~VIS4 段（各 6875 B，表 4.23）
+CSV_IR_LEN, CSV_VIS_LEN = 2866, 6875
+assert CSV_VIS_OFF[3] + CSV_VIS_LEN == CSV_REC
+
+LINE_QUALITY_BITS = {4: "丢线补空", 3: "坏线", 2: "计数校正", 1: "时间校正", 0: "有误码"}
+
+
+class CSVFile:
+    """
+    FY-2（02 批）存档格式 **CSV（压缩 S-VISSR）** 读取器 —— 格式说明第 4 章。
+
+    文件 = 1 条元数据记录 + 2500 条数据记录，每条 41260 字节：
+        记录号(2) 行质量码(1) DOC段(2293) IR1~IR4(4×2866) VIS1~VIS4(4×6875)
+    各段都以 2 字节段标志块开头（首字节 0，次字节为段序号 1~9），数据本身与
+    S-VISSR2.0 的文件段/图像段一致，只是已排序、已压缩（无同步码、无 CRC/填充）。
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.size = os.path.getsize(path)
+        self.n_records = self.size // CSV_REC
+        self.n_frames = max(0, self.n_records - 1)     # 第 0 条是元数据记录
+        self.stride, self.skip, self.transform = CSV_REC, 0, "csv"
+        self.check_crc = False
+        self.meta: Dict[str, object] = {}
+        self.line_quality = np.zeros(0, np.uint8)
+        self._mm = None
+        self.layout = {
+            "format": "CSV（压缩 S-VISSR 存档）",
+            "record_bytes": CSV_REC,
+            "records": self.n_records,
+            "data_records": self.n_frames,
+            "score": 12,
+        }
+
+    def __enter__(self):
+        self._mm = np.memmap(self.path, dtype=np.uint8, mode="r")
+        self._read_meta()
+        return self
+
+    def __exit__(self, *exc):
+        self._mm = None
+
+    def record(self, i: int) -> np.ndarray:
+        """第 i 条数据记录（0 基，对应文件里的第 i+1 条）。"""
+        a = (i + 1) * CSV_REC
+        return self._mm[a:a + CSV_REC]
+
+    def _read_meta(self) -> None:
+        """表 4.20 元数据记录（字段偏移与文档 C 结构体一致）。"""
+        if self.n_records < 1:
+            return
+        head = self._mm[:CSV_REC].tobytes()
+
+        def fld(a: int, b: int) -> str:
+            return head[a:b].decode("ascii", "replace").strip("\x00 ")
+
+        self.meta = {
+            "file_name": fld(3, 43),
+            "format": fld(44, 48),
+            "version": fld(49, 53),
+            "manufacturer": fld(54, 62),
+            "obs_start": fld(63, 78),
+            "generated": fld(79, 94),
+            "satellite": fld(95, 100),
+            "instrument": fld(101, 106),
+            "record_length": fld(107, 112),
+            "record_count": fld(113, 117),
+            "quality_flag": fld(118, 122),
+            "first_scan_num": fld(124, 128),
+            "first_scan_time": fld(128, 144),
+            "last_scan_num": fld(144, 148),
+            "last_scan_time": fld(148, 164),
+            "total_scan_lines": fld(164, 168),
+            "count_fixed_lines": fld(168, 172),
+            "time_fixed_lines": fld(172, 176),
+            "sdb_flag": head[176],
+            "lost_lines": fld(177, 181),
+            "file_error_rate": fld(181, 185),
+            "file_quality": fld(185, 189),
+        }
+        self.line_quality = np.frombuffer(head[189:189 + 2500], np.uint8).copy()
+
+    def doc_bytes(self, i: int) -> bytes:
+        return self.record(i)[CSV_DOC_OFF:CSV_DOC_OFF + CSV_DOC_LEN].tobytes()
+
+    def doc_summary(self, i: int) -> Tuple[int, ...]:
+        return _doc_summary(self.doc_bytes(i))
+
+    def frame(self, i: int, with_images: bool = True) -> Frame:
+        rec = self.record(i)
+        doc, const, groups, sg, sr = parse_file_segment(
+            rec[CSV_DOC_OFF:CSV_DOC_OFF + CSV_DOC_LEN].tobytes())
+        ir = vis = None
+        if with_images:
+            ir = np.zeros((IR_CHANNELS, IR_COLS), np.uint16)
+            vis = np.zeros((VIS_CHANNELS, VIS_COLS), np.uint8)
+            for c in range(IR_CHANNELS):
+                seg = rec[CSV_IR_OFF[c]:CSV_IR_OFF[c] + CSV_IR_LEN]
+                bits = np.unpackbits(seg[2:])          # 跳 2 字节段标志块
+                ir[c] = (bits[:IR_COLS * 10].reshape(IR_COLS, 10) @ W10).astype(np.uint16)
+            for c in range(VIS_CHANNELS):
+                seg = rec[CSV_VIS_OFF[c]:CSV_VIS_OFF[c] + CSV_VIS_LEN]
+                bits = np.unpackbits(seg[2:])
+                vis[c] = (bits[:VIS_COLS * 6].reshape(VIS_COLS, 6) @ W6)
+        return Frame(index=i, doc=doc, const=const, groups=groups, sub_group=sg,
+                     sub_repeat=sr, ir=ir, vis=vis, id_ok=9, crc_ok=0)
+
+    def __iter__(self):
+        for i in range(self.n_frames):
+            yield self.frame(i)
+
+
+def detect_format(path: str) -> str:
+    """自动识别文件格式：'csv'（压缩 S-VISSR 存档）或 'svissr'（展宽码流/净帧）。"""
+    size = os.path.getsize(path)
+    if size >= CSV_REC and size % CSV_REC == 0:
+        with open(path, "rb") as f:
+            head = f.read(128)
+        if b"CSVS" in head or b"RECL" in head:
+            return "csv"
+    return "svissr"
+
+
+def open_reader(path: str, fmt: str = "auto", check_crc: bool = False):
+    """按格式打开读取器（CSVFile / SVISSRFile）。"""
+    f = detect_format(path) if fmt in (None, "auto") else fmt
+    if f == "csv":
+        return CSVFile(path)
+    return SVISSRFile(path, check_crc=check_crc)
 
 
 # ============================================================== 8. 图像组装
@@ -682,14 +1376,14 @@ def _ts_valid(ts: int) -> bool:
     return 1990 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31
 
 
-def scan_docs(sf: "SVISSRFile", n: int) -> Dict[str, np.ndarray]:
+def scan_docs(sf, n: int) -> Dict[str, np.ndarray]:
     """扫描整个码流的文件段，返回按帧索引的紧凑 ndarray（内存 ~n×50 字节）。"""
     keys = ("scan_mode", "scan_status", "frame_flag", "image_flag", "start_line",
             "end_line", "line_count", "visr", "sat_id", "beta", "spin")
     cols = {k: np.zeros(n, np.int32) for k in keys}
     ts = np.full(n, -1, np.int64)
     for i in range(n):
-        s = _doc_summary(sf.frame_bytes(i)[:2293])
+        s = sf.doc_summary(i)
         for k, v in zip(keys, s[:11]):
             cols[k][i] = v
         ts[i] = s[11]
@@ -777,28 +1471,77 @@ def decode(path: str, outdir: str, *, max_frames: Optional[int] = None,
            graticule: bool = True, lut_path: Optional[str] = None,
            falsecolor: bool = True, rollback: bool = True,
            fill_from_rollback: bool = False, rollback_tolerance: int = 2,
-           max_passes: Optional[int] = None, only_pass: Optional[int] = None):
+           max_passes: Optional[int] = None, only_pass: Optional[int] = None,
+           fmt: str = "auto", subblocks_only: bool = False,
+           subblocks_all: bool = False):
     """
-    解码入口。一个文件里可能有多幅全圆盘图（多次观测），此时按幅分段、逐幅流式输出，
-    每幅一个子目录；只有一幅时保持原来的扁平输出结构。
+    解码入口。支持两种格式（默认自动识别）：
+      * S-VISSR 2.0 展宽码流 / 已解扰净帧（.svissr，可含多幅）
+      * CSV 压缩 S-VISSR 存档（.DAT，FY-2 存档格式，一个文件一幅）
 
-    返回 Product（单幅）或 List[Product]（多幅）。
+    一个文件里可能有多幅全圆盘图时，按幅分段、逐幅流式输出（每幅一个子目录）；
+    只有一幅时保持扁平输出结构。返回 Product（单幅）或 List[Product]（多幅）。
     """
     log = (lambda *a: None) if quiet else (lambda *a: print(*a, flush=True))
 
-    with SVISSRFile(path, check_crc=check_crc) as sf:
+    with open_reader(path, fmt, check_crc=check_crc) as sf:
         lay = sf.layout
-        log(f"[i] 码流识别: 帧长 {sf.stride} 字节 / 跳过 {sf.skip} 字节 / 变换 {sf.transform}"
-            f" / ID 命中 {lay['score']}/12")
+        if isinstance(sf, CSVFile):
+            log(f"[i] 格式识别: CSV（压缩 S-VISSR 存档）/ 每条记录 {CSV_REC} 字节"
+                f" / 共 {sf.n_records} 条（1 条元数据 + {sf.n_frames} 条数据）")
+            md = sf.meta
+            log(f"[i] 元数据: {md.get('satellite')} {md.get('instrument')} "
+                f"观测 {md.get('obs_start')} ~ {md.get('last_scan_time')} "
+                f"RECL={md.get('record_length')} REC={md.get('record_count')} "
+                f"QID={md.get('quality_flag')}")
+        else:
+            log(f"[i] 格式识别: S-VISSR 码流 / 帧长 {sf.stride} 字节 / 跳过 {sf.skip} 字节"
+                f" / 变换 {sf.transform} / ID 命中 {lay['score']}/12")
         n = sf.n_frames if max_frames is None else min(max_frames, sf.n_frames)
         log(f"[i] 文件 {sf.size/1e6:.1f} MB -> {n} 帧（每条扫描线一帧）")
 
+        # --- 只扫子交换块：不解图像，适合超长/多幅的大文件
+        if subblocks_only:
+            sets = scan_subblocks(sf, n, log, max_sets=max_passes)
+            os.makedirs(outdir, exist_ok=True)
+            best = _best_subset(sets)
+            if best is not None:
+                _write_subblocks(best["best"], outdir, log)
+            _write_subblock_sets(sets, outdir, log, dump_all=subblocks_all)
+            meta = {
+                "source": os.path.abspath(path),
+                "file_size": sf.size,
+                "layout": sf.layout,
+                "output_dir": os.path.abspath(outdir),
+                "subblocks_only": True,
+                "frames": n,
+                "sets": [{"index": int(s["index"]) + 1, "frames": int(s["frames"]),
+                          "first_frame": int(s["first_frame"]),
+                          "last_frame": int(s["last_frame"]),
+                          "complete": bool(s["complete"]),
+                          "groups": {k: int(s["stats"][k]["groups"]) for k in SUB_KEYS}}
+                         for s in sets],
+                "best_set": (int(best["index"]) + 1) if best is not None else None,
+            }
+            with open(os.path.join(outdir, "subblocks_only.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(meta, fh, ensure_ascii=False, indent=2)
+            return Product(meta=meta)
+
         # --- 轻量扫描：只解文件段（按字节切片，不展开位流）
         docs = scan_docs(sf, n)
-        passes = segment_passes(docs, n)
+        if isinstance(sf, CSVFile):
+            # CSV 存档已按行号排好序（记录号 1..2500），一个文件就是一幅
+            passes = [{"frames": list(range(n)), "rollback": [],
+                       "rows": [i + 1 for i in range(n)]}]
+        else:
+            passes = segment_passes(docs, n)
         log(f"[i] 扫描完成：识别出 {len(passes)} 幅图像")
         for k, ps in enumerate(passes):
-            s, e = _pass_start_row(docs, ps["frames"])
+            if ps.get("rows"):
+                s, e = min(ps["rows"]), max(ps["rows"])
+            else:
+                s, e = _pass_start_row(docs, ps["frames"])
             t0 = _fmt_time(int(docs["time"][ps["frames"][0]]))
             log(f"      第 {k+1} 幅: {len(ps['frames'])} 帧（行 {s}~{e}），"
                 f"回扫帧 {len(ps['rollback'])}，起报 {t0}")
@@ -841,7 +1584,7 @@ def decode(path: str, outdir: str, *, max_frames: Optional[int] = None,
                 lut=lut, lut_path=lut_path, falsecolor=falsecolor, rollback=rollback,
                 fill_from_rollback=fill_from_rollback,
                 rollback_tolerance=rollback_tolerance,
-                keep_arrays=(len(sel) == 1)))
+                keep_arrays=(len(sel) == 1), subblocks_all=subblocks_all))
             gc.collect()
 
         return prods[0] if len(prods) == 1 else prods
@@ -856,41 +1599,52 @@ def _decode_pass(sf: "SVISSRFile", docs: Dict[str, np.ndarray],
                  falsecolor: bool = True,
                  rollback: bool = True, fill_from_rollback: bool = False,
                  rollback_tolerance: int = 2,
-                 keep_arrays: bool = True) -> Product:
+                 keep_arrays: bool = True,
+                 subblocks_all: bool = False) -> Product:
     """解码一幅（一次全圆盘观测）：拼图 -> 补齐 -> 定标 -> 出图，然后释放内存。"""
     frames: List[int] = list(ps["frames"])
     rb_frames: List[int] = list(ps["rollback"])
-    start_row, end_row = _pass_start_row(docs, frames)
-    n_rows = end_row - start_row + 1
-    log(f"[i] 图像行范围 {start_row}~{end_row}（{n_rows} 行）")
-
-    # --- 行号映射：优先用"图像有效行计数"，误码时按顺序补齐
     rows: Dict[int, Optional[int]] = {}
     last_row: Optional[int] = None
-    for i in frames:
-        cand = None
-        cnt = int(docs["line_count"][i])
-        if int(docs["image_flag"][i]) == 0xFF and 1 <= cnt <= 2500:
-            cand = start_row + cnt - 1
-            if not (start_row <= cand <= end_row):
-                cand = None
-            elif last_row is not None and (cand <= last_row or cand - last_row > 4):
-                cand = last_row + 1 if last_row < end_row else None
-        if cand is None and last_row is not None and last_row < end_row:
-            cand = last_row + 1
-        if cand is None or cand > end_row:
+
+    if ps.get("rows"):                       # CSV 存档：记录号就是行号
+        for i, r in zip(frames, ps["rows"]):
+            rows[i] = int(r)
+        start_row, end_row = int(min(ps["rows"])), int(max(ps["rows"]))
+    else:
+        start_row, end_row = _pass_start_row(docs, frames)
+        # --- 行号映射：优先用"图像有效行计数"，误码时按顺序补齐
+        for i in frames:
             cand = None
-        else:
-            last_row = cand
-        rows[i] = cand
+            cnt = int(docs["line_count"][i])
+            if int(docs["image_flag"][i]) == 0xFF and 1 <= cnt <= 2500:
+                cand = start_row + cnt - 1
+                if not (start_row <= cand <= end_row):
+                    cand = None
+                elif last_row is not None and (cand <= last_row or cand - last_row > 4):
+                    cand = last_row + 1 if last_row < end_row else None
+            if cand is None and last_row is not None and last_row < end_row:
+                cand = last_row + 1
+            if cand is None or cand > end_row:
+                cand = None
+            else:
+                last_row = cand
+            rows[i] = cand
+
+    n_rows = end_row - start_row + 1
+    log(f"[i] 图像行范围 {start_row}~{end_row}（{n_rows} 行）")
 
     ir = np.zeros((IR_CHANNELS, n_rows, IR_COLS), np.uint16)
     vis = np.zeros((VIS_CHANNELS, n_rows, VIS_COLS), np.uint8)
     filled = np.zeros(n_rows, bool)
 
-    # 子交换块：同一组在连续 8 条扫描线里重复发送 8 次，按比特多数表决纠错
-    sub_copies: Dict[str, Dict[int, List[bytes]]] = {
-        "cal1": {}, "cal2": {}, "grid": {}, "orbit": {}, "manam": {}}
+    # 子交换块：按"每 200 行一套"收集，每类每组 8 份重复做比特多数表决。
+    # 套的边界用相位投票定（见 _estimate_phase），避免个别帧组号误码把一套切碎。
+    sample = frames[::3] if len(frames) > 96 else frames[:32]
+    phase = _estimate_phase(
+        (i, *_subblock_from_doc(sf.doc_bytes(i))[:2]) for i in sample)
+    sb_sets: List[Dict[str, object]] = []
+    cur_set: Optional[Dict[str, object]] = None
     consts: List[Dict[str, Optional[float]]] = []
     used = 0
     dups = 0
@@ -902,13 +1656,14 @@ def _decode_pass(sf: "SVISSRFile", docs: Dict[str, np.ndarray],
         fr = sf.frame(i, with_images=True)
         done += 1
         consts.append(fr.const)
-        for key in ("cal1", "cal2", "grid", "orbit", "manam"):
-            g = fr.sub_group
-            blk = fr.groups.get(key)
-            if blk and 0 <= g < 25:
-                lst = sub_copies[key].setdefault(g, [])
-                if len(lst) < 8:
-                    lst.append(blk)
+        g, rp = fr.sub_group, fr.sub_repeat
+        if 0 <= g < 25:
+            set_idx = (phase + i) // SUB_SET_LINES
+            if cur_set is None or int(cur_set["index"]) != set_idx:
+                if cur_set is not None:
+                    sb_sets.append(_finish_subset(cur_set))
+                cur_set = _new_subset(set_idx, i, int(docs["time"][i]))
+            _add_to_subset(cur_set, i, int(docs["time"][i]), g, fr.groups)
         r = rows.get(i)
         if r is None:
             continue
@@ -938,10 +1693,16 @@ def _decode_pass(sf: "SVISSRFile", docs: Dict[str, np.ndarray],
         if done % 400 == 0:
             log(f"    ... {done}/{total_jobs} 帧（回扫）")
 
-    # 分组表决 -> 每个子交换组一份最优数据
-    sub_best: Dict[str, Dict[int, bytes]] = {
-        kk: {g: _vote_bytes(v) for g, v in d.items()} for kk, d in sub_copies.items()}
-    del sub_copies
+    # 每套表决后取最完整的一套作为该幅的定标/网格/轨道/MANAM 来源
+    if cur_set is not None:
+        sb_sets.append(_finish_subset(cur_set))
+    best_st = _best_subset(sb_sets)
+    sub_best: Dict[str, Dict[int, bytes]] = (best_st["best"] if best_st
+                                             else {k: {} for k in SUB_KEYS})
+    if sb_sets:
+        log(f"[i] 子交换块: {len(sb_sets)} 套（完整 "
+            f"{sum(1 for s in sb_sets if s['complete'])} 套），采用第 "
+            f"{int(best_st['index']) + 1} 套")
 
     cal = Calibration.from_groups(sub_best, "cal2")
     if not cal.ir:
@@ -1083,6 +1844,8 @@ def _decode_pass(sf: "SVISSRFile", docs: Dict[str, np.ndarray],
                      "with_line_number": sum(1 for e in rb_entries if e["visr"])},
         "subblocks": {kk: sorted(v.keys()) for kk, v in sub_best.items()},
     }
+    if isinstance(sf, CSVFile):
+        meta["csv"] = {**sf.meta, "line_quality_sum": int((sf.line_quality != 0).sum())}
     if lut is not None:
         meta["false_color"] = {
             "clut": os.path.abspath(lut_path or ""),
@@ -1098,6 +1861,11 @@ def _decode_pass(sf: "SVISSRFile", docs: Dict[str, np.ndarray],
 
     os.makedirs(outdir, exist_ok=True)
     _write_metadata(prod, cal, outdir, grid)
+    _write_subblocks(sub_best, outdir, log)
+    if sb_sets:
+        _write_subblock_sets(sb_sets, outdir, log, dump_all=subblocks_all)
+    if isinstance(sf, CSVFile) and sf.line_quality.size:
+        _write_line_quality(sf, outdir, log)
     if rollback and rb_entries:
         _write_rollback(rb_entries, outdir, cal, start_row, log,
                         despike=despike, save_npz=save_npz)
@@ -1502,6 +2270,21 @@ def _render(prod: Product, cal: Calibration, outdir: str, log=print,
             log("[+] fy2_falsecolor.png  (CLUT: x=可见光亮度, y=IR1 亮温)")
 
 
+def _write_line_quality(sf: "CSVFile", outdir: str, log=print) -> None:
+    """CSV 存档的行质量码（表 4.26）：每行 1 字节，导出成 CSV 便于排查坏行。"""
+    q = sf.line_quality
+    rows = np.nonzero(q)[0]
+    with open(os.path.join(outdir, "line_quality.csv"), "w", encoding="utf-8") as f:
+        f.write("row,code,hex,flags\n")
+        for i in rows:
+            code = int(q[i])
+            flags = "、".join(t for b, t in LINE_QUALITY_BITS.items() if code & (1 << b))
+            f.write(f'{i + 1},{code},0x{code:02X},"{flags}"\n')
+    n_bad = int((q & 0x08).astype(bool).sum())      # bit3 = 坏线
+    n_drop = int((q & 0x10).astype(bool).sum())     # bit4 = 丢线补空
+    log(f"[+] line_quality.csv  {len(rows)}/{q.size} 行有标记（坏线 {n_bad}、丢线补空 {n_drop}）")
+
+
 def _write_metadata(prod: Product, cal: Calibration, outdir: str,
                     grid: Optional[np.ndarray] = None) -> None:
     meta = dict(prod.meta)
@@ -1546,6 +2329,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例:\n"
                "  python fy2_svissr.py fengyun_svissr.svissr -o out\n"
+               "  python fy2_svissr.py FY2G_CSV_..._1300.DAT -o out      # CSV 存档，自动识别\n"
+               "  python fy2_svissr.py big.svissr --list-passes\n"
                "  python fy2_svissr.py raw.bin --info\n")
     ap.add_argument("input", help="输入文件（.svissr / 原始 S-VISSR 码流）")
     ap.add_argument("-o", "--outdir", default="out", help="输出目录（默认 out）")
@@ -1572,7 +2357,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="一个文件里有多幅图时，只解前 N 幅")
     ap.add_argument("--only-pass", type=int, default=None, metavar="N",
                     help="只解第 N 幅（1 基）")
+    ap.add_argument("--format", choices=("auto", "svissr", "csv"), default="auto",
+                    help="输入格式：auto（默认，按文件内容识别）/ svissr / csv（压缩 S-VISSR 存档）")
     ap.add_argument("--list-passes", action="store_true", help="列出文件里所有幅，不解码")
+    ap.add_argument("--subblocks-only", action="store_true",
+                    help="只扫子交换块（定标/网格/轨道/MANAM），不解图像；适合超长多幅文件")
+    ap.add_argument("--subblocks-all", action="store_true",
+                    help="子交换块按套各存一份 subblocks/setNN/（默认只存最完整的一套）")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
 
@@ -1581,14 +2372,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if a.info or a.list_passes:
-        with SVISSRFile(a.input, check_crc=a.check_crc) as sf:
+        with open_reader(a.input, a.format, check_crc=a.check_crc) as sf:
+            is_csv = isinstance(sf, CSVFile)
             print(json.dumps(sf.layout, ensure_ascii=False, indent=2))
-            print(f"帧数: {sf.n_frames}")
+            print(f"帧（记录）数: {sf.n_frames}")
+            if is_csv:
+                print("元数据记录（表 4.20）:")
+                print(json.dumps(sf.meta, ensure_ascii=False, indent=2))
+                q = sf.line_quality
+                print(f"行质量码: {int((q != 0).sum())}/{q.size} 行有标记")
             docs = scan_docs(sf, sf.n_frames)
-            passes = segment_passes(docs, sf.n_frames)
+            if is_csv:
+                passes = [{"frames": list(range(sf.n_frames)), "rollback": [],
+                           "rows": [i + 1 for i in range(sf.n_frames)]}]
+            else:
+                passes = segment_passes(docs, sf.n_frames)
             print(f"识别出 {len(passes)} 幅图像:")
             for k, ps in enumerate(passes):
-                s, e = _pass_start_row(docs, ps["frames"])
+                s, e = ((min(ps["rows"]), max(ps["rows"])) if ps.get("rows")
+                        else _pass_start_row(docs, ps["frames"]))
                 print(f"  第 {k+1} 幅: 帧 {ps['frames'][0]}~{ps['frames'][-1]}，"
                       f"{len(ps['frames'])} 行（{s}~{e}），回扫帧 {len(ps['rollback'])}，"
                       f"起报 {_fmt_time(int(docs['time'][ps['frames'][0]]))}")
@@ -1606,8 +2408,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                  falsecolor=not a.no_falsecolor, rollback=not a.no_rollback,
                  fill_from_rollback=a.fill_from_rollback,
                  rollback_tolerance=a.rollback_tolerance,
-                 max_passes=a.max_passes, only_pass=a.only_pass)
+                 max_passes=a.max_passes, only_pass=a.only_pass, fmt=a.format,
+                 subblocks_only=a.subblocks_only, subblocks_all=a.subblocks_all)
     prods = res if isinstance(res, list) else [res]
+    m0 = getattr(prods[0], "meta", {}) or {}
+    if m0.get("subblocks_only"):
+        print(f"\n===== 子块扫描完成：{len(m0['sets'])} 套 =====")
+        for st in m0["sets"]:
+            mark = "完整" if st["complete"] else "不全"
+            print(f"  第 {st['index']:2d} 套: 帧 {st['first_frame']}~{st['last_frame']}"
+                  f"（{st['frames']} 帧，{mark}） 组数 "
+                  + " ".join(f"{k}={v}" for k, v in st["groups"].items()))
+        print(f"采用第 {m0['best_set']} 套")
+        print(f"输出目录    : {m0['output_dir']}")
+        return 0
     print(f"\n===== 解码完成（{len(prods)} 幅） =====")
     for p in prods:
         m = p.meta
